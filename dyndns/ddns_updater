@@ -1,8 +1,9 @@
 #!/bin/sh
 # HomeMade DynDNS Updater Script, with HTTPS/SSL Support. 
 # A script to let your DDWRT router update your DNS records for any of your domain when it detects that your WAN IP changed.
+# Note that it will only update the existing record's content and not add new record so make sure to manually add 'A' DNS records first
 # This example uses Cloudflare's HTTPS/SSL URL update method to update the IP for example.com *.example.com and www.example.com.
-# This script aims be to be run as a DDWRT cron job.
+# This script aims be to be run as a DDWRT cron job. i.e 0,10,20,30,40,50 * * * * root /opt/ddns/ddns_once &> /dev/null
 # Edit the settings section to match your DNS provider, including the Domain, ZONE Ids and Record Ids.
 # This script requires curl and its CA Bundle to be installed in $CA_BUNDLE path.
 # made by zgorizzo@pm.me
@@ -15,114 +16,117 @@
 #     -H "Authorization: Bearer PUT_CLOUDFLARE_BEARER_TOKEN_HERE" \
 #     -H "Content-Type:application/json" \
 #     | jq '.result[] | .id,.name'
-# WILDCARD_DNS_RECORDID: 'A' type dns record id for *.YOURDOMAIN.TLD as returned by the cloudflare API
-# WWW_DNS_RECORDID: 'A' type dns record id for www.YOURDOMAIN.TLD as returned by the cloudflare API
-# ROOT_DNS_RECORDID: 'A' type dns record id for YOURDOMAIN.TLD as returned by the cloudflare API
-#	# curl -X GET "https://api.cloudflare.com/client/v4/zones/YOUR_DOMAIN_ZONE_ID/dns_records" \
-#     -H "Authorization: Bearer PUT_CLOUDFLARE_BEARER_TOKEN_HERE" \
-#     -H "Content-Type: application/json" \
-#    | jq  '.result[]  | select( .type == "A" )  | .id,.name,.content'
-# these field should be seperated by @
-DDNS_DOMAIN_OBJECTS=domain1.com@ZONEID1@WILDCARD_RECORDID1@WWW_DNS_RECORDID1@ROOT_DNS_RECORDID1,\
-domain2.com@ZONEID2@WILDCARD_RECORDID2@WWW_DNS_RECORDID2@ROOT_DNS_RECORDID2
+# these fields should be seperated by @ i.e: DNS_DOMAIN_OBJECTS=whales.com@456dq6d4s6d54sddqaefqs,wall.tv@45754sd4fd2f57d7c811c17cf61
+DDNS_DOMAIN_OBJECTS=domain1.com@ZONEID1,\
+domain2.com@ZONEID2
 
 
 # go to cloudflare api token and add one that can edit zone on your domains 
 CLOUDFLARE_BEARER_TOKEN=XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
 
- 
-LOG_FILE=/jffs/log/ddns/dyndns.log
+# make sure to have a drive mounted for jffs and opt folders 
+LOG_FILE=/jffs/log/ddns/dyndns.log 
 CURL_LOG_FILE=/jffs/log/ddns/curl.log
 CURL_LOCATION=/usr/bin/curl
 CA_BUNDLE=/opt/ddns/cacert.pem
 
 
 ### FUNCTIONS SECTION ###
-dns_update() {
-	DDNS_DOMAIN=$1
-	URL=$2
-	SUBDOMAIN=$3
-	if [ -z "$SUBDOMAIN" ]; then
-		DNAME=${DDNS_DOMAIN}
-	else
-		DNAME=${SUBDOMAIN}.${DDNS_DOMAIN}
-	fi
-	DATA="{\"type\":\"A\",\"name\":\"${DNAME}\",\"content\":\"${CURRENT_WAN_IP}\"}"
+dns_patch() { 
+	CUR_DDNS_RECORD_URL=$1
+	DATA="{\"content\":\"${CURRENT_WAN_IP}\"}"
 	$CURL_LOCATION \
-		-X PUT ${URL} \
+		-X PATCH ${CUR_DDNS_RECORD_URL} \
 		-H "Authorization: Bearer ${CLOUDFLARE_BEARER_TOKEN}" \
 		-H "Content-Type:application/json" \
 		--cacert ${CA_BUNDLE} \
-		--data ${DATA} >>$CURL_LOG_FILE
+		--data ${DATA} >> $CURL_LOG_FILE
 }
 ### END SETTINGS SECTION
-update_all_dns_records() {
-	DOMAIN=$1
-	ZONEID=$2
-	WILDCARD_RECID=$3
-	WWW_RECID=$4
-	ROOT_RECID=$5
+get_all_dns_records() { 
+	ZONEID=$1
+ 
+    RECORDS=$($CURL_LOCATION \
+            -X GET "https://api.cloudflare.com/client/v4/zones/$ZONEID/dns_records?type=A" \
+            -H "Authorization: Bearer ${CLOUDFLARE_BEARER_TOKEN}" \
+            -H "Content-Type:application/json" \
+            --cacert ${CA_BUNDLE} \
+            | sed -n "/{/,/}/{s/[^:]*:[[:blank:]]*//p;}" \
+            | sed -E 's/\},\s*\{/\},\n\{/g' \
+            | grep  '"id":' \
+            | cut -d : -f2 \
+            | awk -F\" '{print $2}')
 
-	echo $DOMAIN $ZONEID $WILDCARD_RECID $WWW_RECID $ROOT_RECID
-	CUR_DDNS_WILDCARD_URL="https://api.cloudflare.com/client/v4/zones/$ZONEID/dns_records/$WILDCARD_RECID"
-	CUR_DDNS_WWW_URL="https://api.cloudflare.com/client/v4/zones/$ZONEID/dns_records/$WWW_RECID"
-	CUR_DDNS_ROOT_URL="https://api.cloudflare.com/client/v4/zones/$ZONEID/dns_records/$ROOT_RECID"
-	dns_update $DOMAIN $CUR_DDNS_ROOT_URL
-	dns_update $DOMAIN $CUR_DDNS_WILDCARD_URL "*"
-	dns_update $DOMAIN $CUR_DDNS_WWW_URL "www"
+
+} 
+
+update_one_dns_record() {
+    ZONEID=$1
+	RECID=$2
+    CUR_DDNS_RECORD_URL="https://api.cloudflare.com/client/v4/zones/$ZONEID/dns_records/$RECID"
+    echo -e "dns_patch $CUR_DDNS_RECORD_URL  \n" >> $LOG_FILE
+    dns_patch $CUR_DDNS_RECORD_URL   
 }
+
+update_all_dns_records() { 
+	ZONEID=$1
+    get_all_dns_records $ZONEID 
+    for RECID in $RECORDS
+        do
+            update_one_dns_record $ZONEID $RECID
+    done
+
+
+} 
+
+get_dns_record_content() {
+    ZONEID=$1
+	RECID=$2
+    CUR_RECORD_DETAIL=$($CURL_LOCATION \
+            -X GET "https://api.cloudflare.com/client/v4/zones/$ZONEID/dns_records/$RECID" \
+            -H "Authorization: Bearer ${CLOUDFLARE_BEARER_TOKEN}" \
+            -H "Content-Type:application/json" \
+            --cacert ${CA_BUNDLE})
+    CUR_RECORD_CONTENT=$(echo $CUR_RECORD_DETAIL \
+            | sed -n 's/.*\("content":[^}]*\).*/\1/p' \
+            | cut -d : -f2 \
+            | awk -F\" '{print $2}')
+    CUR_RECORD_NAME=$(echo $CUR_RECORD_DETAIL \
+            | sed -n 's/.*\("name":[^}]*\).*/\1/p' \
+            | cut -d : -f2 \
+            | awk -F\" '{print $2}')
+}
+
+
 check_to_update() {
     DOMAIN=$1
 	ZONEID=$2
-	WILDCARD_RECID=$3
-	WWW_RECID=$4
-	ROOT_RECID=$5
-	WAN_IP=$6
-    LAST_WAN_IP=$7
-    
+	WAN_IP=$3
 	# beware that if the subdomain is proxied we will get the ip of the proxy server
-	RANDOM=$(head /dev/urandom | tr -dc "0123456789" | cut -c 1-8)
-	DDNS_HOSTNAME="test${RANDOM}"
-	CURRENT_TIME=$(date)	
-	DNS_IP=$(nslookup $DDNS_HOSTNAME.$DOMAIN 173.245.58.65 | grep Address | tail -n 1 | awk '{print $3}')
-
-	if [ -z "$DNS_IP" ]; then
-		DNS_IP=$(nslookup $DDNS_HOSTNAME.$DOMAIN 173.245.58.65 | grep Address | tail -n 1 | awk '{print $2}')
-	fi
-	logger -p user.debug  "IP Registered for $DDNS_HOSTNAME.$DDNS_DOMAIN is $DNS_IP" 
-	# Check if IP Address has changed from last locally stored IP
-	if [ "${WAN_IP}" != "${LAST_WAN_IP}" ]; then
-		echo "$CURRENT_TIME: IP has changed from $LAST_WAN_IP to $WAN_IP for domain:${DDNS_DOMAIN}" >>$LOG_FILE
-		# Update the last locally stored IP
-	    nvram set wan_ipaddr_last=${WAN_IP}
-	    nvram commit
-		update_all_dns_records $DOMAIN $ZONEID $WILDCARD_RECID $WWW_RECID $ROOT_RECID
-		echo "$CURRENT_TIME: Updated DNS Service, server sent response:" >>$LOG_FILE
-		echo -e "\n" >>$LOG_FILE
-		cat $CURL_LOG_FILE >>$LOG_FILE
-		echo -e "\n" >>$LOG_FILE
-		rm $CURL_LOG_FILE
-		logger -p user.warning "$CURRENT_TIME: Updated DNS Service IP has been changed from ${LAST_WAN_IP} to ${CURRENT_WAN_IP} for domain:${DDNS_DOMAIN}"
-		continue
-
-	# Check if IP Address has changed from what DNS is reporting
-	elif [ "${WAN_IP}" != "${DNS_IP}" ]; then
-		echo "$CURRENT_TIME: DNS IP not up to date, currently: $DNS_IP, but our IP is $WAN_IP for domain:${DDNS_DOMAIN}" >>$LOG_FILE
-		update_all_dns_records $DOMAIN $ZONEID $WILDCARD_RECID $WWW_RECID $ROOT_RECID
-		echo "$CURRENT_TIME: Updated DNS Service, server sent response:" >>$LOG_FILE
-		echo -e "\n" >>$LOG_FILE
-		cat $CURL_LOG_FILE >>$LOG_FILE
-		echo -e "\n" >>$LOG_FILE
-		rm $CURL_LOG_FILE
-		logger -p user.warning "$CURRENT_TIME: Updated DNS : IP in registrar was not up to date it was ${DNS_IP} and was changed to ${CURRENT_WAN_IP} for domain:${DDNS_DOMAIN}"
-	fi
-
+ 
+	CURRENT_TIME=$(date)
+    # get all the records from DNS	
+	get_all_dns_records $ZONEID 
+    # check that they are all equal to the current WAN IP
+    for RECID in $RECORDS
+        do
+        get_dns_record_content $ZONEID $RECID
+        echo -e "$CURRENT_TIME: check $CUR_RECORD_NAME IP:$CUR_RECORD_CONTENT against WAN_IP:$WAN_IP   \n"
+        if [ "${WAN_IP}" != "${CUR_RECORD_CONTENT}" ]; then
+            echo -e "$CURRENT_TIME: IP for domain:$CUR_RECORD_NAME has been changed from $CUR_RECORD_CONTENT to $WAN_IP \n" >> $LOG_FILE
+            update_one_dns_record $ZONEID $RECID
+            logger -p user.debug  "IP Registered for $CUR_RECORD_NAME changed from $CUR_RECORD_CONTENT to $WAN_IP"
+        fi
+    done 
 }
 
 ### MAIN SECTION ###
 
-CURRENT_WAN_IP=$(nvram get wan_ipaddr)
-LAST_WAN_IP=$(nvram get wan_ipaddr_last)
+## If your are in a DMZ for instance you can't get your wan IP but a local one with get wan_ipaddr
+## you can use this command instead 
+## CURRENT_WAN_IP=$(curl ifconfig.me) 
+
+CURRENT_WAN_IP=$(nvram get wan_ipaddr) 
 
 for obj in $(echo $DDNS_DOMAIN_OBJECTS | sed "s/,/ /g")
 	do
@@ -135,18 +139,9 @@ for obj in $(echo $DDNS_DOMAIN_OBJECTS | sed "s/,/ /g")
 			elif [ $INDEX = 1 ] 
 			then
 				CUR_CLOUDFLARE_ZONEID=${field}
-			elif [ $INDEX = 2 ] 
-			then
-				CUR_CLOUDFLARE_WILDCARD_DNS_RECORDID=${field}
-			elif [ $INDEX = 3 ] 
-			then
-				CUR_CLOUDFLARE_WWW_DNS_RECORDID=${field}
-			elif [ $INDEX = 4 ] 
-			then
-				CUR_CLOUDFLARE_ROOT_DNS_RECORDID=${field}
 			fi
 			let INDEX=${INDEX}+1
 	done
-	echo $CUR_DOMAIN $CUR_CLOUDFLARE_ZONEID $CUR_CLOUDFLARE_WILDCARD_DNS_RECORDID $CUR_CLOUDFLARE_WWW_DNS_RECORDID $CUR_CLOUDFLARE_ROOT_DNS_RECORDID $CURRENT_WAN_IP $LAST_WAN_IP
-    check_to_update $CUR_DOMAIN $CUR_CLOUDFLARE_ZONEID $CUR_CLOUDFLARE_WILDCARD_DNS_RECORDID $CUR_CLOUDFLARE_WWW_DNS_RECORDID $CUR_CLOUDFLARE_ROOT_DNS_RECORDID $CURRENT_WAN_IP $LAST_WAN_IP
-done 
+	echo $CUR_DOMAIN $CUR_CLOUDFLARE_ZONEID $CURRENT_WAN_IP 
+    check_to_update $CUR_DOMAIN $CUR_CLOUDFLARE_ZONEID $CURRENT_WAN_IP 
+done

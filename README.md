@@ -109,6 +109,8 @@ Here is what worked for me. Simply connect an USB drive to your router and enabl
 
 ![usb](./images/usb.png)
 
+Note that the UUID are the partition labels that must be on the usb drive and that will be mounted to `/jffs` and `/opt`
+
 ### NAS
 
 You can use these USB drive to act like a NAS. It will be quite fast as it directly accessible to the router.
